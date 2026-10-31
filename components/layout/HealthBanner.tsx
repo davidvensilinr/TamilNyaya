@@ -2,19 +2,21 @@
 
 import { useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
-import type { HealthResponse } from '@/lib/api';
+import { api, HealthInfo } from '@/lib/api';
 
 export function HealthBanner() {
-  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [health, setHealth] = useState<HealthInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/health')
-      .then((r) => {
-        if (!r.ok) throw new Error(`${r.status}`);
-        return r.json();
+    api.getHealth()
+      .then((res) => {
+        if (res.data) {
+          setHealth(res.data);
+        } else {
+          setError(res.error || 'Failed to reach backend API');
+        }
       })
-      .then((d) => setHealth(d as HealthResponse))
       .catch((e) => setError(e.message));
   }, []);
 
@@ -22,7 +24,7 @@ export function HealthBanner() {
     return (
       <div className="flex items-center gap-3 px-6 py-2.5 bg-[rgba(220,80,80,.08)] border-b border-[rgba(220,80,80,.25)] text-[#e05555] text-xs">
         <XCircle size={14} />
-        <span>Backend unreachable ({error}). Ensure FastAPI is running on port 8000.</span>
+        <span>Backend unreachable ({error}). Ensure your backend server is running.</span>
       </div>
     );
   }
@@ -42,8 +44,8 @@ export function HealthBanner() {
       {llmOff ? <AlertTriangle size={14} /> : <CheckCircle2 size={14} />}
       <span>
         {llmOff
-          ? 'LLM not enabled — judge-based metrics will be unavailable. Set GROQ_API_KEY to enable.'
-          : `Backend connected · ${health.kb_record_count} KB records · ${health.models?.length ?? 0} models available`}
+          ? `LLM not enabled — ${health.llm_disabled_reason || 'Set GROQ_API_KEY in environment variables.'}`
+          : `Backend connected · ${health.kb_record_count} KB records · All models operational`}
       </span>
     </div>
   );

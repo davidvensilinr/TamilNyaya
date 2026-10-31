@@ -28,13 +28,13 @@ class Settings(BaseSettings):
     # ── LLM / Groq ────────────────────────────────────────────────────────────
     groq_api_key: Optional[str] = Field(default=None, alias="GROQ_API_KEY")
     groq_model_under_test: str = Field(
-        default="llama-3.1-8b-instant", alias="GROQ_MODEL_UNDER_TEST"
+        default="qwen/qwen3.8-27b", alias="GROQ_MODEL_UNDER_TEST"
     )
     groq_model_judge: str = Field(
-        default="llama-3.3-70b-versatile", alias="GROQ_MODEL_JUDGE"
+        default="openai/gpt-oss-120b", alias="GROQ_MODEL_JUDGE"
     )
     groq_model_nli: str = Field(
-        default="llama-3.1-8b-instant", alias="GROQ_MODEL_NLI"
+        default="qwen/qwen3.8-27b", alias="GROQ_MODEL_NLI"
     )
     groq_requests_per_minute: int = Field(
         default=20, ge=1, le=600, alias="GROQ_REQUESTS_PER_MINUTE"

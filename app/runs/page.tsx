@@ -85,11 +85,20 @@ export default function RunsPage() {
             />
           </div>
 
-          {!health?.llm_enabled && (
+          {!health && !loading && (
+            <div className="p-3 bg-[#f87171]/10 border border-[#f87171]/30 rounded text-xs text-[#f87171] flex items-start gap-2">
+              <AlertCircle size={15} className="mt-0.5 flex-shrink-0" />
+              <div>
+                <strong>Cannot connect to Backend API.</strong> Make sure your backend service is running and accessible (or check NEXT_PUBLIC_API_URL).
+              </div>
+            </div>
+          )}
+
+          {health && !health.llm_enabled && (
             <div className="p-3 bg-[#e1a85a]/10 border border-[#e1a85a]/30 rounded text-xs text-[#e1a85a] flex items-start gap-2">
               <AlertCircle size={15} className="mt-0.5 flex-shrink-0" />
               <div>
-                <strong>LLM features are currently disabled.</strong> {health?.llm_disabled_reason || 'Set GROQ_API_KEY in your .env file to enable evaluation runs.'}
+                <strong>LLM features are currently disabled.</strong> {health.llm_disabled_reason || 'Set GROQ_API_KEY in backend environment variables to enable evaluation runs.'}
               </div>
             </div>
           )}
