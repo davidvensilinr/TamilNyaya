@@ -1,15 +1,16 @@
 """
-groq_client.py — Throttled, retrying Groq API client.
+groq_client.py — Throttled, retrying Groq API client with key rotation.
 
 Rules:
-- Respects GROQ_REQUESTS_PER_MINUTE with a token-bucket throttle.
-- Exponential back-off with jitter on HTTP 429 and 5xx.
-- Every retry is logged to the audit log.
+- Maintains one token-bucket per API key so each key gets its own quota.
+- On HTTP 429 (rate limit), immediately rotates to the next available key
+  instead of sleeping and retrying on the same key.
+- Exponential back-off only applies when ALL keys are exhausted.
+- Every retry / rotation is logged to the audit log.
 - The API key is NEVER printed, logged or returned to the frontend.
 - If LLM is disabled (no key), raises LLMDisabledError immediately.
 - Responses are cached by (model, prompt hash) only when the caller
-  explicitly passes cache=True; cached responses are labelled with
-  the original run timestamp.
+  explicitly passes cache=True.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ class LLMResponseError(RuntimeError):
     pass
 
 
-# ── Simple token-bucket rate limiter ─────────────────────────────────────────
+# ── Per-key token-bucket rate limiter ─────────────────────────────────────────
 
 
 class _TokenBucket:
@@ -46,9 +47,15 @@ class _TokenBucket:
         self._rate = rate_per_minute
         self._tokens: float = float(rate_per_minute)
         self._last_refill: float = time.monotonic()
+        self.rate_limited_until: float = 0.0  # epoch seconds; set on 429
 
     def acquire(self) -> float:
-        """Return the number of seconds to sleep before the next request."""
+        """Return seconds to sleep before this key is ready."""
+        # If this key is in a 429 cooldown, report how long left
+        now_wall = time.time()
+        if self.rate_limited_until > now_wall:
+            return self.rate_limited_until - now_wall
+
         now = time.monotonic()
         elapsed = now - self._last_refill
         self._last_refill = now
@@ -60,8 +67,68 @@ class _TokenBucket:
         self._tokens = 0.0
         return wait
 
+    def mark_rate_limited(self, cooldown_seconds: float = 60.0) -> None:
+        """Mark this key as rate-limited for the given duration."""
+        self.rate_limited_until = time.time() + cooldown_seconds
 
-_bucket = _TokenBucket(settings.groq_requests_per_minute)
+
+# ── Key pool — one bucket per API key ────────────────────────────────────────
+
+class _KeyPool:
+    """Round-robin pool of Groq API keys, each with its own rate limiter."""
+
+    def __init__(self) -> None:
+        self._keys: list[str] = []
+        self._buckets: list[_TokenBucket] = []
+        self._index: int = 0
+
+    def _init(self) -> None:
+        """Lazily initialise from settings (so tests can monkeypatch settings)."""
+        if not self._keys:
+            self._keys = list(settings.all_groq_keys)
+            self._buckets = [
+                _TokenBucket(settings.groq_requests_per_minute)
+                for _ in self._keys
+            ]
+
+    def next_available(self) -> tuple[str, _TokenBucket, int]:
+        """Return (api_key, bucket, key_index) for the next available key.
+
+        Prefers a key whose bucket has tokens ready.  If all keys are busy,
+        returns the one with the shortest wait.
+        """
+        self._init()
+        best_key_idx = self._index % len(self._keys)
+        best_wait = float("inf")
+
+        for offset in range(len(self._keys)):
+            idx = (self._index + offset) % len(self._keys)
+            wait = self._buckets[idx].acquire.__self__._TokenBucket__tokens  # peek
+            # Use acquire() to get actual wait time — it also updates tokens
+            wait = self._buckets[idx].acquire()
+            if wait == 0.0:
+                self._index = (idx + 1) % len(self._keys)
+                return self._keys[idx], self._buckets[idx], idx
+            if wait < best_wait:
+                best_wait = wait
+                best_key_idx = idx
+
+        self._index = (best_key_idx + 1) % len(self._keys)
+        return self._keys[best_key_idx], self._buckets[best_key_idx], best_key_idx
+
+    def rotate_after_rate_limit(self, key_idx: int, cooldown: float = 62.0) -> None:
+        """Mark a specific key as rate-limited and advance the pool index."""
+        self._init()
+        self._buckets[key_idx].mark_rate_limited(cooldown)
+        self._index = (key_idx + 1) % len(self._keys)
+
+    @property
+    def key_count(self) -> int:
+        self._init()
+        return len(self._keys)
+
+
+_pool = _KeyPool()
 
 
 # ── Response dataclass ────────────────────────────────────────────────────────
@@ -92,7 +159,7 @@ def _cache_key(model: str, messages: list[dict], **kwargs) -> str:
 
 # ── Core chat completion ──────────────────────────────────────────────────────
 
-MAX_RETRIES = 5
+MAX_RETRIES = 8   # across all keys combined
 
 
 def chat_completion(
@@ -105,20 +172,13 @@ def chat_completion(
     run_id: Optional[str] = None,
 ) -> LLMResponse:
     """
-    Send a chat completion request to Groq.
-
-    Parameters
-    ----------
-    messages  : OpenAI-format message list.
-    model     : Model name (defaults to GROQ_MODEL_UNDER_TEST).
-    temperature, max_tokens, seed : Generation parameters.
-    cache     : If True, cache the response and label cache hits.
-    run_id    : Audit-log association.
+    Send a chat completion request to Groq, rotating through available API keys
+    on 429 rate-limit errors instead of sleeping on the same key.
 
     Raises
     ------
-    LLMDisabledError   : Key not configured.
-    LLMRateLimitError  : Rate limit not resolved after MAX_RETRIES.
+    LLMDisabledError   : No key configured.
+    LLMRateLimitError  : All keys rate-limited after MAX_RETRIES.
     LLMResponseError   : Non-recoverable API error.
     """
     from .. import audit  # lazy import to avoid circular dependency
@@ -129,21 +189,23 @@ def chat_completion(
     _model = model or settings.groq_model_under_test
 
     if cache:
-        key = _cache_key(_model, messages, temperature=temperature, max_tokens=max_tokens)
-        if key in _response_cache:
-            cached = _response_cache[key]
+        ck = _cache_key(_model, messages, temperature=temperature, max_tokens=max_tokens)
+        if ck in _response_cache:
+            cached = _response_cache[ck]
             cached.cached = True
             return cached
 
-    # Lazy-import groq so the app starts even if groq is not installed
     try:
         from groq import Groq, RateLimitError, APIStatusError
     except ImportError as exc:
         raise LLMDisabledError("groq package not installed") from exc
 
-    client = Groq(api_key=settings.groq_api_key)
-
-    kwargs: dict = {"model": _model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    kwargs: dict = {
+        "model": _model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
     if seed is not None:
         kwargs["seed"] = seed
 
@@ -151,11 +213,14 @@ def chat_completion(
     last_exc: Optional[Exception] = None
 
     for attempt in range(MAX_RETRIES):
-        wait = _bucket.acquire()
+        api_key, bucket, key_idx = _pool.next_available()
+        wait = bucket.acquire()
         if wait > 0:
-            time.sleep(wait)
+            time.sleep(min(wait, 5.0))  # cap single sleep at 5s; rotate will help more
 
+        client = Groq(api_key=api_key)
         t_start = time.monotonic()
+
         try:
             response = client.chat.completions.create(**kwargs)
             latency_ms = int((time.monotonic() - t_start) * 1000)
@@ -170,25 +235,35 @@ def chat_completion(
                 raw=response.model_dump() if hasattr(response, "model_dump") else {},
             )
             if cache:
-                _response_cache[key] = result  # type: ignore[possibly-undefined]
+                _response_cache[ck] = result  # type: ignore[possibly-undefined]
             return result
 
         except RateLimitError as exc:
             last_exc = exc
             retry_count += 1
-            backoff = (2 ** attempt) + random.uniform(0.0, 1.0)
+            # Mark this key as rate-limited and rotate immediately
+            _pool.rotate_after_rate_limit(key_idx, cooldown=62.0)
             audit.log_retry(
                 "llm_rate_limit",
-                f"Rate limit on attempt {attempt + 1}; sleeping {backoff:.1f}s",
+                f"Key #{key_idx + 1} rate-limited on attempt {attempt + 1}; "
+                f"rotating to next key ({_pool.key_count} keys available)",
                 run_id=run_id,
             )
-            time.sleep(backoff)
+            # Only sleep if we've exhausted all keys in this round
+            if retry_count % _pool.key_count == 0:
+                backoff = 5.0 + random.uniform(0.0, 2.0)
+                audit.log_retry(
+                    "llm_all_keys_limited",
+                    f"All {_pool.key_count} key(s) rate-limited; sleeping {backoff:.1f}s",
+                    run_id=run_id,
+                )
+                time.sleep(backoff)
 
         except APIStatusError as exc:
             if exc.status_code >= 500:
                 last_exc = exc
                 retry_count += 1
-                backoff = (2 ** attempt) + random.uniform(0.0, 1.0)
+                backoff = (2 ** min(attempt, 4)) + random.uniform(0.0, 1.0)
                 audit.log_retry(
                     "llm_server_error",
                     f"HTTP {exc.status_code} on attempt {attempt + 1}; sleeping {backoff:.1f}s",
@@ -202,15 +277,15 @@ def chat_completion(
             raise LLMResponseError(f"Unexpected error from Groq: {exc}") from exc
 
     raise LLMRateLimitError(
-        f"Rate limit not resolved after {MAX_RETRIES} retries. Last error: {last_exc}"
+        f"Rate limit not resolved after {MAX_RETRIES} retries across {_pool.key_count} key(s). "
+        f"Last error: {last_exc}"
     )
 
 
 def verify_model_availability(model_name: str) -> tuple[bool, list[str]]:
     """
     Check whether model_name is in Groq's live model list.
-    Returns (available: bool, available_models: list[str]).
-    Fails gracefully if the API is unreachable.
+    Uses the primary API key. Fails gracefully if the API is unreachable.
     """
     if not settings.llm_enabled:
         return False, []

@@ -26,7 +26,10 @@ class Settings(BaseSettings):
     )
 
     # ── LLM / Groq ────────────────────────────────────────────────────────────
+    # Primary key — required for LLM features
     groq_api_key: Optional[str] = Field(default=None, alias="GROQ_API_KEY")
+    # Optional fallback keys (comma-separated) rotated on 429 rate-limit errors
+    groq_api_key_fallbacks: Optional[str] = Field(default=None, alias="GROQ_API_KEY_FALLBACKS")
     groq_model_under_test: str = Field(
         default="qwen/qwen3.8-27b", alias="GROQ_MODEL_UNDER_TEST"
     )
@@ -37,7 +40,7 @@ class Settings(BaseSettings):
         default="qwen/qwen3.8-27b", alias="GROQ_MODEL_NLI"
     )
     groq_requests_per_minute: int = Field(
-        default=20, ge=1, le=600, alias="GROQ_REQUESTS_PER_MINUTE"
+        default=30, ge=1, le=600, alias="GROQ_REQUESTS_PER_MINUTE"
     )
 
     # ── Database ───────────────────────────────────────────────────────────────
@@ -74,11 +77,24 @@ class Settings(BaseSettings):
     # ── Derived (not from env) ────────────────────────────────────────────────
     llm_enabled: bool = False          # set by model_validator below
     llm_disabled_reason: str = ""
+    all_groq_keys: list[str] = Field(default_factory=list)  # populated by validator
 
     @model_validator(mode="after")
     def _check_llm(self) -> "Settings":
         key = self.groq_api_key
-        if not key or key.strip() == "" or key == "your_groq_api_key_here":
+        placeholder = "your_groq_api_key_here"
+
+        # Collect all valid keys: primary + fallbacks
+        all_keys: list[str] = []
+        if key and key.strip() and key.strip() != placeholder:
+            all_keys.append(key.strip())
+        if self.groq_api_key_fallbacks:
+            for k in self.groq_api_key_fallbacks.split(","):
+                k = k.strip()
+                if k and k != placeholder:
+                    all_keys.append(k)
+
+        if not all_keys:
             self.llm_enabled = False
             self.llm_disabled_reason = (
                 "GROQ_API_KEY is missing or not set. "
@@ -86,6 +102,7 @@ class Settings(BaseSettings):
             )
         else:
             self.llm_enabled = True
+            self.all_groq_keys = all_keys
         return self
 
     @field_validator("data_raw_dir", mode="before")
@@ -96,10 +113,13 @@ class Settings(BaseSettings):
         return p
 
     def safe_dict(self) -> dict:
-        """Return settings as a dict with the API key redacted and types JSON-safe."""
+        """Return settings as a dict with API keys redacted and types JSON-safe."""
         d = self.model_dump(mode="json")
         if d.get("groq_api_key"):
             d["groq_api_key"] = "***REDACTED***"
+        if d.get("groq_api_key_fallbacks"):
+            d["groq_api_key_fallbacks"] = "***REDACTED***"
+        d["all_groq_keys"] = f"[{len(self.all_groq_keys)} key(s) configured]"
         return d
 
 
