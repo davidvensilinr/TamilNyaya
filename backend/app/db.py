@@ -34,7 +34,7 @@ from .config import settings
 # ── Engine ─────────────────────────────────────────────────────────────────────
 engine = create_engine(
     settings.database_url,
-    connect_args={"check_same_thread": False},  # SQLite only
+    connect_args={"check_same_thread": False, "timeout": 60},  # SQLite concurrency timeout
     echo=False,
 )
 

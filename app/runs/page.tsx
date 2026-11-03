@@ -11,7 +11,8 @@ import { PlaySquare, Download, RefreshCw, AlertCircle, Sparkles, Terminal, Check
 export default function RunsPage() {
   const [runs, setRuns] = useState<RunSummary[]>([])
   const [health, setHealth] = useState<HealthInfo | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [initialLoading, setInitialLoading] = useState(true)
   const [starting, setStarting] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
@@ -22,18 +23,34 @@ export default function RunsPage() {
   const [seed, setSeed] = useState(42)
 
   useEffect(() => {
-    loadData()
+    loadData(false)
   }, [])
 
-  async function loadData() {
-    setLoading(true)
-    const [rRes, hRes] = await Promise.all([
-      api.listRuns(50, 0),
-      api.getHealth(),
-    ])
-    if (rRes.data) setRuns(rRes.data)
-    if (hRes.data) setHealth(hRes.data)
-    setLoading(false)
+  // Auto-poll progress every 4s when any run is actively running or pending
+  useEffect(() => {
+    const hasActive = runs.some((r) => r.status === 'running' || r.status === 'pending')
+    if (!hasActive) return
+
+    const timer = setInterval(() => {
+      loadData(true)
+    }, 4000)
+
+    return () => clearInterval(timer)
+  }, [runs])
+
+  async function loadData(isSilent = false) {
+    if (!isSilent) setLoading(true)
+    try {
+      const [rRes, hRes] = await Promise.all([
+        api.listRuns(50, 0),
+        api.getHealth(),
+      ])
+      if (rRes.data) setRuns(rRes.data)
+      if (hRes.data) setHealth(hRes.data)
+    } finally {
+      if (!isSilent) setLoading(false)
+      setInitialLoading(false)
+    }
   }
 
   async function handleStartRun(e: React.FormEvent) {
@@ -41,19 +58,24 @@ export default function RunsPage() {
     setStarting(true)
     setErrorMsg(null)
 
-    const res = await api.startRun({
-      model_id: modelId,
-      temperature,
-      max_tokens: maxTokens,
-      seed,
-    })
+    try {
+      const res = await api.startRun({
+        model_id: modelId,
+        temperature,
+        max_tokens: maxTokens,
+        seed,
+      })
 
-    if (res.data) {
-      await loadData()
-    } else {
-      setErrorMsg(res.error || 'Failed to trigger evaluation run')
+      if (res.data) {
+        await loadData(true)
+      } else {
+        setErrorMsg(res.error || 'Failed to trigger evaluation run')
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to trigger evaluation run')
+    } finally {
+      setStarting(false)
     }
-    setStarting(false)
   }
 
   return (
@@ -182,14 +204,23 @@ export default function RunsPage() {
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-[#e1edf0]">Recorded Evaluation Runs ({runs.length})</h2>
             <button
-              onClick={loadData}
+              onClick={() => loadData(false)}
               className="text-xs text-[#718493] hover:text-[#eef5f7] flex items-center gap-1 font-mono"
             >
-              <RefreshCw size={12} /> Refresh
+              <RefreshCw size={12} className={loading ? "animate-spin" : ""} /> Refresh
             </button>
           </div>
 
-          {loading ? (
+          {runs.some(r => r.status === 'running' || r.status === 'pending') && (
+            <div className="p-3 bg-[#66d9e8]/10 border border-[#66d9e8]/30 rounded text-xs text-[#66d9e8] flex items-center gap-2">
+              <RefreshCw size={14} className="animate-spin flex-shrink-0 text-[#66d9e8]" />
+              <span>
+                <strong>Evaluation in progress:</strong> Processing items against Groq with free-tier rate-limit pacing (~15–20 minutes for full 147 items). Items and error counts update automatically.
+              </span>
+            </div>
+          )}
+
+          {initialLoading && runs.length === 0 ? (
             <div className="text-center py-12 text-xs text-[#8295a1]">Loading runs...</div>
           ) : runs.length > 0 ? (
             <div className="space-y-3">
