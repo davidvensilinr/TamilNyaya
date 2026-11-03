@@ -23,10 +23,10 @@ from .. import audit as audit_mod
 from ..config import settings
 
 
-async def execute_run(run_id: str, req) -> None:
+def execute_run(run_id: str, req) -> None:
     """
     Execute or resume a run.  All errors are caught per-item and recorded.
-    The run never crashes the process.
+    The run never crashes the process.  Runs synchronously in a background thread.
     """
     with get_db_session() as session:
         run = session.query(EvalRun).filter_by(run_id=run_id).first()

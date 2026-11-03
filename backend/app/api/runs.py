@@ -217,7 +217,7 @@ async def get_trace(run_id: str, item_id: str) -> TraceOut:
 
 # ── Background run executor ────────────────────────────────────────────────────
 
-async def _execute_run(run_id: str, req: RunRequest) -> None:
-    """Execute an evaluation run in the background.  Resumable."""
+def _execute_run(run_id: str, req: RunRequest) -> None:
+    """Execute an evaluation run in a background worker thread. Resumable."""
     from ..pipeline.runner import execute_run
-    await execute_run(run_id, req)
+    execute_run(run_id, req)
